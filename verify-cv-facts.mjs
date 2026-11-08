@@ -124,6 +124,9 @@ const ATTRIBUTION_STOP_WORDS = new Set([
   'engaged', 'for', 'from', 'hired', 'implemented', 'in', 'managed', 'my', 'of',
   'on', 'our', 'oversaw', 'partnered', 'programmed', 'supervised', 'the', 'through',
   'to', 'vendor', 'vendors', 'with', 'wrote',
+  // French function words of three letters or more, so "des"/"pour"/"avec" cannot link two unrelated entries.
+  'aux', 'avec', 'ces', 'cette', 'chez', 'dans', 'depuis', 'des', 'entre', 'est', 'les',
+  'leur', 'leurs', 'par', 'pour', 'que', 'qui', 'ses', 'son', 'sur', 'une', 'vers',
 ]);
 const METRIC_NOUNS = [
   'users', 'customers', 'clients', 'employees', 'engineers', 'teams', 'companies',
@@ -1663,6 +1666,30 @@ const SCOPE_VERB_TIERS = new Map([
   ['own', 3], ['owned', 3], ['owns', 3], ['owning', 3],
   ['architect', 3], ['architected', 3], ['architects', 3], ['architecting', 3],
   ['drive', 3], ['drove', 3], ['drives', 3], ['driving', 3],
+  // French (language.output: fr). French CV bullets open as often with an action
+  // noun ("Conception de…", "Pilotage de…") as with a verb, so both are listed.
+  // Tier 1: participation, or work on something someone else built.
+  ['contribution', 1], ['contributions', 1], ['contribuer', 1], ['contribué', 1], ['contribue', 1],
+  ['contributeur', 1], ['contributrice', 1],
+  ['participation', 1], ['participer', 1], ['participé', 1], ['participe', 1],
+  ['aide', 1], ['aidé', 1], ['aider', 1], ['soutien', 1], ['appui', 1],
+  ['maintenance', 1], ['maintenir', 1], ['maintenu', 1], ['maintenue', 1], ['maintient', 1],
+  ['reprise', 1], ['repris', 1], ['reprendre', 1], ['reprend', 1],
+  // Work on an existing system: evolving or fixing it does not claim having designed it.
+  ['évolution', 1], ['évolutions', 1], ['correction', 1], ['corrections', 1],
+  // Tier 2: execution.
+  ['conception', 2], ['concevoir', 2], ['conçu', 2], ['conçue', 2], ['conçoit', 2],
+  ['développement', 2], ['développer', 2], ['développé', 2], ['développée', 2], ['développe', 2],
+  ['réalisation', 2], ['réaliser', 2], ['réalisé', 2], ['réalisée', 2], ['réalise', 2],
+  ['création', 2], ['créer', 2], ['créé', 2], ['créée', 2], ['crée', 2],
+  ['construction', 2], ['construire', 2], ['construit', 2], ['construite', 2],
+  ['implémentation', 2], ['implémenter', 2], ['implémenté', 2], ['implémente', 2],
+  ['refonte', 2],
+  // Tier 3: ownership.
+  ['pilotage', 3], ['piloter', 3], ['piloté', 3], ['pilote', 3],
+  ['diriger', 3], ['dirigé', 3], ['dirige', 3],
+  ['encadrement', 3], ['encadrer', 3], ['encadré', 3], ['encadre', 3],
+  ['mené', 3], ['mener', 3], ['mène', 3],
 ]);
 
 // Bullet glyphs and list markers survive stripMarkup. They have to come off
@@ -1740,6 +1767,7 @@ function opensWithJobTitle(text) {
 const SCOPE_PHRASE_TIERS = [
   [/^worked\s+on\b/iu, 1],
   [/^part\s+of\s+the\s+team\b/iu, 1],
+  [/^(?:a\s+)?(?:mise?s?|mettre|met)\s+en\s+(?:place|œuvre|oeuvre)\b/iu, 2],
 ];
 
 const HEADING_RE = /^#{1,6}\s+/u;
@@ -1755,7 +1783,7 @@ const SUBJECT_PRONOUN_RE = /^(?:i|we)\s+/iu;
 // coordinator-led clause to the one before it because a stated plan governs
 // both halves. A verb does not: "Contributed to the billing migration and led
 // the payments rewrite" makes exactly one tier-3 claim, about the rewrite.
-const SCOPE_CLAUSE_SPLIT_RE = /\s*[,;:]\s*|\s+(?:and|then|plus|while|before|after)\s+/iu;
+const SCOPE_CLAUSE_SPLIT_RE = /\s*[,;:]\s*|\s+(?:and|then|plus|while|before|after|et|puis|avant|après|tandis\s+que)\s+/iu;
 
 /** Split a statement into clauses, so a verb is weighed only against its own work item. */
 function scopeClauses(statement) {
@@ -1825,18 +1853,24 @@ export function scopeInflationClaims(targetText, sourceText) {
   // "Contributed to the billing migration and led the payments rewrite"
   // cleared "Led the billing migration" on the strength of a verb that was
   // never about the migration.
+  const frenchSource = looksFrench(stripMarkup(sourceText));
   const sourceClauses = factStatements(sourceText)
     .map(stripListMarker)
     .flatMap((statement) => {
       const heading = HEADING_RE.test(statement);
-      return scopeClauses(statement).map(clause => ({
+      // A bare verb with no object ("Conception et évolution d'applications",
+      // "Designed and evolved the app") governs the object of the next clause,
+      // so its tier is carried forward instead of being dropped with its empty clause.
+      let carried = 0;
+      return scopeClauses(statement).map((clause) => {
+        const tokens = new Set(scopeObjectTokens(clause));
+        const own = sourceClauseTier(clause, heading);
+        const tier = carried && own !== Infinity ? Math.max(own, carried) : own;
+        carried = tokens.size ? 0 : Math.max(carried, own === Infinity ? 0 : own);
         // The whole statement is what gets quoted back, since a clause on its own
         // reads as a fragment to whoever has to go and fix cv.md.
-        statement,
-        heading,
-        tier: sourceClauseTier(clause, heading),
-        tokens: new Set(scopeObjectTokens(clause)),
-      }));
+        return { statement, heading, tier, tokens };
+      });
     })
     .filter(source => source.tokens.size);
   if (!sourceClauses.length) return [];
@@ -1892,7 +1926,10 @@ export function scopeInflationClaims(targetText, sourceText) {
       // candidate did, so it is no evidence that the source is weaker.
       const linked = overlaps.filter(({ overlap, source }) => overlap >= required && !source.heading);
       if (!linked.length) continue;
-      const vouched = overlaps.some(({ overlap, source }) => overlap > 0 && source.tier >= opening.tier);
+      // French bullets often open with a plain noun ("Équipe de 3 développeurs…"), which reads as an
+      // unknown tier; such a clause only vouches when it shares as much as a linking clause would.
+      const vouched = overlaps.some(({ overlap, source }) => overlap > 0 && source.tier >= opening.tier
+        && (source.tier !== Infinity || !frenchSource || overlap >= required));
       if (vouched) continue;
 
       const closest = linked.reduce((best, next) => (next.overlap > best.overlap ? next : best));
@@ -1956,6 +1993,19 @@ const ADOPTION_CHECKS = [
     // "Standardised the linter across every team" failed to evidence
     // "Became standard across the platform teams" and blocked a truthful line.
     source: /\bstandards?\b|\bstandardi[sz](?:e|es|ed|ing|ation)\b/iu,
+  },
+  // French equivalents (language.output: fr).
+  {
+    target: /\butilisée?s?\s+au\s+quotidien\b/giu,
+    source: /\bquotidien(?:ne)?s?\b/iu,
+  },
+  {
+    target: /(?:à\s+l['’]échelle\s+(?:de\s+)?(?:l['’]entreprise|du\s+groupe)|dans\s+tout(?:e)?\s+(?:l['’]entreprise|le\s+groupe))/giu,
+    source: /(?:échelle|tout(?:e)?\s+(?:l['’]entreprise|le\s+groupe))/iu,
+  },
+  {
+    target: /\badoptée?s?\s+par\b/giu,
+    source: /\badopt(?:é|ée|és|ées|er|ion)\b/iu,
   },
 ];
 
@@ -2282,6 +2332,22 @@ function looksEnglish(text) {
   return !(other >= 2 && other > english);
 }
 
+const FRENCH_FUNCTION_WORDS = new Set([
+  'le', 'les', 'des', 'du', 'et', 'pour', 'avec', 'par', 'une', 'dans', 'sur', 'au', 'aux', 'est', 'qui',
+]);
+
+/** Whether a text reads as French: more French than English function words, at least five. */
+function looksFrench(text) {
+  let french = 0;
+  let english = 0;
+  for (const [word] of String(text).matchAll(/[\p{L}]+/gu)) {
+    const lower = word.toLowerCase();
+    if (FRENCH_FUNCTION_WORDS.has(lower)) french++;
+    else if (ENGLISH_FUNCTION_WORDS.has(lower)) english++;
+  }
+  return french >= 5 && french > english;
+}
+
 /**
  * Explain why the scope and adoption checks did not run, or return null.
  *
@@ -2292,9 +2358,13 @@ function looksEnglish(text) {
  * @returns {string|null}
  */
 function scopeLanguageGap(targetText, sourceText) {
-  const targetEnglish = looksEnglish(stripMarkup(targetText));
-  const sourceEnglish = looksEnglish(stripMarkup(sourceText));
+  const target = stripMarkup(targetText);
+  const source = stripMarkup(sourceText);
+  const targetEnglish = looksEnglish(target);
+  const sourceEnglish = looksEnglish(source);
   if (targetEnglish && sourceEnglish) return null;
+  // The scope-verb table also carries French, so a French CV checked against a French cv.md is readable.
+  if (looksFrench(target) && looksFrench(source)) return null;
   const subject = !targetEnglish && !sourceEnglish
     ? 'The document and its sources are'
     : !targetEnglish ? 'The document is' : 'Its sources are';
